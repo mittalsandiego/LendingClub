@@ -1,0 +1,523 @@
+# ============================================================
+# MLOps CI/CD Pipeline
+# AAI-540 Final Project | Group 9 | University of San Diego
+#
+# Triggered on push to main or manual dispatch.
+# Implements the 7-checkpoint pipeline described in the
+# ML System Design Document (Section 9: Model CI/CD).
+#
+# Checkpoints:
+#   1. Data Validation      — schema + row count checks on S3
+#   2. Training Job         — launch SageMaker XGBoost training
+#   3. Evaluation Gate      — accuracy >= 0.75, weighted F1 >= 0.70
+#   4. Model Registration   — register in SageMaker Model Registry
+#   5. Human Approval       — wait for manual approval in GitHub
+#   6. Endpoint Update      — deploy approved model to endpoint
+#   7. Smoke Test           — verify endpoint responds correctly
+# ============================================================
+
+name: LendWise MLOps Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'LoanStatus_MLOps_Project.ipynb'
+      - '.github/workflows/mlops_pipeline.yml'
+      - 'scripts/**'
+  workflow_dispatch:
+    inputs:
+      skip_training:
+        description: 'Skip training and use latest registered model (true/false)'
+        required: false
+        default: 'false'
+      model_package_arn:
+        description: 'Model Package ARN to deploy (skips training if provided)'
+        required: false
+        default: ''
+
+# ── Global environment variables ─────────────────────────────
+env:
+  AWS_REGION: us-east-1
+  S3_BUCKET: sagemaker-us-east-1-099405935674
+  S3_PREFIX: aai540-group9-loan-project
+  GLUE_DATABASE: aai540_vmittalATsandiego_loan
+  GLUE_TABLE: loan_data
+  MODEL_PACKAGE_GROUP: loan-status-prediction-xgboost
+  ENDPOINT_NAME: loan-status-xgb-prod
+  ACCURACY_THRESHOLD: "0.75"
+  WEIGHTED_F1_THRESHOLD: "0.70"
+  INSTANCE_TYPE_TRAIN: ml.m5.xlarge
+  INSTANCE_TYPE_DEPLOY: ml.m5.large
+  PYTHON_VERSION: "3.9"
+
+jobs:
+
+  # ══════════════════════════════════════════════════════════
+  # CHECKPOINT 1 — DATA VALIDATION
+  # Verify S3 data files exist, schema is correct, and
+  # each class has enough records to train on.
+  # ══════════════════════════════════════════════════════════
+  data-validation:
+    name: "Checkpoint 1 — Data Validation"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install boto3 pandas pyarrow awswrangler --quiet
+
+      - name: Validate S3 data files exist
+        run: |
+          python scripts/validate_data.py \
+            --bucket ${{ env.S3_BUCKET }} \
+            --prefix ${{ env.S3_PREFIX }}/data \
+            --glue-database ${{ env.GLUE_DATABASE }} \
+            --glue-table ${{ env.GLUE_TABLE }} \
+            --min-rows-per-class 1000 \
+            --expected-columns 111
+
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-validation-report
+          path: reports/data_validation_report.json
+          retention-days: 30
+
+
+  # ══════════════════════════════════════════════════════════
+  # CHECKPOINT 2 — MODEL TRAINING
+  # Launch SageMaker managed XGBoost training job.
+  # Waits for completion and captures the model artifact URI.
+  # ══════════════════════════════════════════════════════════
+  train-model:
+    name: "Checkpoint 2 — SageMaker Training Job"
+    runs-on: ubuntu-latest
+    needs: data-validation
+    if: github.event.inputs.skip_training != 'true' && github.event.inputs.model_package_arn == ''
+
+    outputs:
+      model_artifact_uri: ${{ steps.train.outputs.model_artifact_uri }}
+      training_job_name: ${{ steps.train.outputs.training_job_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install boto3 "sagemaker==2.*" pandas --quiet
+
+      - name: Launch SageMaker training job
+        id: train
+        run: |
+          python scripts/train_model.py \
+            --bucket ${{ env.S3_BUCKET }} \
+            --prefix ${{ env.S3_PREFIX }} \
+            --instance-type ${{ env.INSTANCE_TYPE_TRAIN }} \
+            --output-file training_outputs.json
+
+          # Parse outputs and set as step outputs
+          MODEL_URI=$(python -c "import json; d=json.load(open('training_outputs.json')); print(d['model_artifact_uri'])")
+          JOB_NAME=$(python -c "import json; d=json.load(open('training_outputs.json')); print(d['training_job_name'])")
+          echo "model_artifact_uri=$MODEL_URI" >> $GITHUB_OUTPUT
+          echo "training_job_name=$JOB_NAME" >> $GITHUB_OUTPUT
+          echo "Training Job: $JOB_NAME"
+          echo "Model Artifact: $MODEL_URI"
+
+      - name: Upload training outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-outputs
+          path: training_outputs.json
+          retention-days: 30
+
+
+  # ══════════════════════════════════════════════════════════
+  # CHECKPOINT 3 — EVALUATION GATE
+  # Run the held-out test set evaluation.
+  # Fail and block registration if:
+  #   - Overall accuracy < 0.75
+  #   - Weighted F1 < 0.70
+  # ══════════════════════════════════════════════════════════
+  evaluate-model:
+    name: "Checkpoint 3 — Evaluation Gate"
+    runs-on: ubuntu-latest
+    needs: train-model
+
+    outputs:
+      accuracy: ${{ steps.evaluate.outputs.accuracy }}
+      weighted_f1: ${{ steps.evaluate.outputs.weighted_f1 }}
+      evaluation_passed: ${{ steps.evaluate.outputs.evaluation_passed }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install boto3 "sagemaker==2.*" pandas scikit-learn "xgboost==2.*" --quiet
+
+      - name: Download training outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: training-outputs
+
+      - name: Run evaluation on test set
+        id: evaluate
+        run: |
+          python scripts/evaluate_model.py \
+            --bucket ${{ env.S3_BUCKET }} \
+            --prefix ${{ env.S3_PREFIX }} \
+            --model-artifact-uri ${{ needs.train-model.outputs.model_artifact_uri }} \
+            --accuracy-threshold ${{ env.ACCURACY_THRESHOLD }} \
+            --f1-threshold ${{ env.WEIGHTED_F1_THRESHOLD }} \
+            --output-file evaluation_report.json
+
+          # Parse results
+          ACCURACY=$(python -c "import json; d=json.load(open('evaluation_report.json')); print(d['accuracy'])")
+          WEIGHTED_F1=$(python -c "import json; d=json.load(open('evaluation_report.json')); print(d['weighted_f1'])")
+          PASSED=$(python -c "import json; d=json.load(open('evaluation_report.json')); print(d['evaluation_passed'])")
+
+          echo "accuracy=$ACCURACY" >> $GITHUB_OUTPUT
+          echo "weighted_f1=$WEIGHTED_F1" >> $GITHUB_OUTPUT
+          echo "evaluation_passed=$PASSED" >> $GITHUB_OUTPUT
+
+          echo "Accuracy: $ACCURACY (threshold: ${{ env.ACCURACY_THRESHOLD }})"
+          echo "Weighted F1: $WEIGHTED_F1 (threshold: ${{ env.WEIGHTED_F1_THRESHOLD }})"
+          echo "Evaluation passed: $PASSED"
+
+      - name: Fail pipeline if evaluation did not pass
+        if: steps.evaluate.outputs.evaluation_passed != 'True'
+        run: |
+          echo " Evaluation gate FAILED."
+          echo "   Accuracy: ${{ steps.evaluate.outputs.accuracy }} (required >= ${{ env.ACCURACY_THRESHOLD }})"
+          echo "   Weighted F1: ${{ steps.evaluate.outputs.weighted_f1 }} (required >= ${{ env.WEIGHTED_F1_THRESHOLD }})"
+          echo "   Model will NOT be registered. Review training and data quality."
+          exit 1
+
+      - name: Upload evaluation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-report
+          path: evaluation_report.json
+          retention-days: 30
+
+
+  # ══════════════════════════════════════════════════════════
+  # CHECKPOINT 4 — MODEL REGISTRATION
+  # Register the evaluated model in SageMaker Model Registry
+  # as a new versioned Model Package with PendingManualApproval.
+  # Auto-updates the Model Card with current run metrics.
+  # ══════════════════════════════════════════════════════════
+  register-model:
+    name: "Checkpoint 4 — Model Registration"
+    runs-on: ubuntu-latest
+    needs: [train-model, evaluate-model]
+    if: needs.evaluate-model.outputs.evaluation_passed == 'True'
+
+    outputs:
+      model_package_arn: ${{ steps.register.outputs.model_package_arn }}
+      model_package_version: ${{ steps.register.outputs.model_package_version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install boto3 "sagemaker==2.*" --quiet
+
+      - name: Download evaluation report
+        uses: actions/download-artifact@v4
+        with:
+          name: evaluation-report
+
+      - name: Register model package in SageMaker Model Registry
+        id: register
+        run: |
+          python scripts/register_model.py \
+            --bucket ${{ env.S3_BUCKET }} \
+            --model-artifact-uri ${{ needs.train-model.outputs.model_artifact_uri }} \
+            --model-package-group ${{ env.MODEL_PACKAGE_GROUP }} \
+            --training-job-name ${{ needs.train-model.outputs.training_job_name }} \
+            --evaluation-report evaluation_report.json \
+            --git-sha ${{ github.sha }} \
+            --output-file registration_outputs.json
+
+          PKG_ARN=$(python -c "import json; d=json.load(open('registration_outputs.json')); print(d['model_package_arn'])")
+          PKG_VER=$(python -c "import json; d=json.load(open('registration_outputs.json')); print(d['model_package_version'])")
+          echo "model_package_arn=$PKG_ARN" >> $GITHUB_OUTPUT
+          echo "model_package_version=$PKG_VER" >> $GITHUB_OUTPUT
+          echo "Registered: $PKG_ARN (version $PKG_VER) — status: PendingManualApproval"
+
+      - name: Upload registration outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: registration-outputs
+          path: registration_outputs.json
+          retention-days: 30
+
+      - name: Comment registration details on commit
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const accuracy = '${{ needs.evaluate-model.outputs.accuracy }}';
+            const f1 = '${{ needs.evaluate-model.outputs.weighted_f1 }}';
+            const pkgArn = '${{ steps.register.outputs.model_package_arn }}';
+            const pkgVer = '${{ steps.register.outputs.model_package_version }}';
+            const body = [
+              '## 🤖 Model Registration — Checkpoint 4 Complete',
+              '',
+              `**Model Package Version:** ${pkgVer}`,
+              `**Model Package ARN:** \`${pkgArn}\``,
+              `**Status:** \`PendingManualApproval\``,
+              '',
+              '| Metric | Value | Threshold | Result |',
+              '|--------|-------|-----------|--------|',
+              `| Accuracy | ${accuracy} | ≥ 0.75 | |`,
+              `| Weighted F1 | ${f1} | ≥ 0.70 | |`,
+              '',
+              '**Next step:** Review the Model Card in SageMaker Model Registry and approve or reject this version.',
+              'Once approved, trigger the deployment workflow manually via `workflow_dispatch`.',
+            ].join('\n');
+            github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body
+            });
+
+
+  # ══════════════════════════════════════════════════════════
+  # CHECKPOINT 5 — HUMAN APPROVAL GATE
+  # Pauses the pipeline and requires a team member to
+  # manually approve deployment via GitHub Environment
+  # protection rules before proceeding.
+  #
+  # Setup: Create a GitHub Environment named "production"
+  # in repo Settings → Environments and add required reviewers.
+  # ══════════════════════════════════════════════════════════
+  human-approval:
+    name: "Checkpoint 5 — Human Approval Gate"
+    runs-on: ubuntu-latest
+    needs: register-model
+    environment:
+      name: production
+      # Requires approval from a team member configured
+      # under Settings → Environments → production → Required reviewers
+
+    steps:
+      - name: Confirm approval received
+        run: |
+          echo "Human approval received."
+          echo "Model Package ARN: ${{ needs.register-model.outputs.model_package_arn }}"
+          echo "Proceeding to endpoint deployment..."
+
+
+  # ══════════════════════════════════════════════════════════
+  # CHECKPOINT 6 — ENDPOINT DEPLOYMENT
+  # Approve the model package in Model Registry, then deploy
+  # to the SageMaker real-time endpoint using an atomic
+  # endpoint config swap (blue/green, zero downtime).
+  # Updates the Model Quality Monitor baseline and schedule.
+  # ══════════════════════════════════════════════════════════
+  deploy-model:
+    name: "Checkpoint 6 — Endpoint Deployment"
+    runs-on: ubuntu-latest
+    needs: [register-model, human-approval]
+
+    outputs:
+      endpoint_name: ${{ steps.deploy.outputs.endpoint_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install boto3 "sagemaker==2.*" --quiet
+
+      - name: Approve model package in Model Registry
+        run: |
+          python scripts/approve_model.py \
+            --model-package-arn ${{ needs.register-model.outputs.model_package_arn }} \
+            --approval-comment "Approved via GitHub Actions CI/CD — commit ${{ github.sha }}"
+
+      - name: Deploy model to SageMaker endpoint
+        id: deploy
+        run: |
+          # deploy_model.py performs an atomic endpoint config swap:
+          # 1. Creates a new endpoint config with the approved model
+          # 2. Calls update_endpoint() — SageMaker handles blue/green routing
+          # 3. Waits for endpoint status InService
+          # 4. Deletes the old endpoint config on success
+          python scripts/deploy_model.py \
+            --model-package-arn ${{ needs.register-model.outputs.model_package_arn }} \
+            --endpoint-name ${{ env.ENDPOINT_NAME }} \
+            --instance-type ${{ env.INSTANCE_TYPE_DEPLOY }} \
+            --bucket ${{ env.S3_BUCKET }} \
+            --prefix ${{ env.S3_PREFIX }} \
+            --output-file deployment_outputs.json
+
+          EP_NAME=$(python -c "import json; d=json.load(open('deployment_outputs.json')); print(d['endpoint_name'])")
+          echo "endpoint_name=$EP_NAME" >> $GITHUB_OUTPUT
+          echo "Endpoint updated: $EP_NAME"
+
+      - name: Update Model Quality Monitor baseline
+        run: |
+          # Recompute baseline from validation set predictions
+          # using the newly deployed model, then update the
+          # monitoring schedule constraints to reflect the
+          # new model version's behavior
+          python scripts/update_monitor.py \
+            --endpoint-name ${{ env.ENDPOINT_NAME }} \
+            --bucket ${{ env.S3_BUCKET }} \
+            --prefix ${{ env.S3_PREFIX }} \
+            --accuracy-threshold ${{ env.ACCURACY_THRESHOLD }}
+
+      - name: Upload deployment outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-outputs
+          path: deployment_outputs.json
+          retention-days: 30
+
+
+  # ══════════════════════════════════════════════════════════
+  # CHECKPOINT 7 — SMOKE TEST
+  # Send 10 known test records to the live endpoint.
+  # Assert that:
+  #   (a) Response contains exactly 3 probabilities per row
+  #   (b) Probabilities sum to 1.0 (±0.01 tolerance)
+  #   (c) Endpoint p99 latency < 500ms
+  # Roll back to previous endpoint config on failure.
+  # ══════════════════════════════════════════════════════════
+  smoke-test:
+    name: "Checkpoint 7 — Smoke Test"
+    runs-on: ubuntu-latest
+    needs: [deploy-model, register-model]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install boto3 "sagemaker==2.*" pandas --quiet
+
+      - name: Run smoke test against live endpoint
+        id: smoke
+        run: |
+          python scripts/smoke_test.py \
+            --endpoint-name ${{ needs.deploy-model.outputs.endpoint_name }} \
+            --bucket ${{ env.S3_BUCKET }} \
+            --prefix ${{ env.S3_PREFIX }} \
+            --num-records 10 \
+            --latency-threshold-ms 500 \
+            --output-file smoke_test_results.json
+
+      - name: Rollback on smoke test failure
+        if: failure()
+        run: |
+          echo " Smoke test FAILED — initiating rollback..."
+          python scripts/rollback_endpoint.py \
+            --endpoint-name ${{ needs.deploy-model.outputs.endpoint_name }} \
+            --bucket ${{ env.S3_BUCKET }} \
+            --prefix ${{ env.S3_PREFIX }}
+          echo "Endpoint rolled back to previous version."
+          exit 1
+
+      - name: Upload smoke test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test-results
+          path: smoke_test_results.json
+          retention-days: 30
+
+      - name: Pipeline complete
+        if: success()
+        run: |
+          echo "All 7 checkpoints passed."
+          echo "   Endpoint: ${{ needs.deploy-model.outputs.endpoint_name }}"
+          echo "   Model Version: ${{ needs.register-model.outputs.model_package_version }}"
+          echo "   Model Package ARN: ${{ needs.register-model.outputs.model_package_arn }}"
+          echo "   Commit: ${{ github.sha }}"
