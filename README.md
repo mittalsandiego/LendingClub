@@ -169,18 +169,46 @@ aai540-group9-loan-project/
 ├── LoanStatus_MLOps_Project.ipynb    # Main notebook — complete MLOps pipeline
 ├── README.md                         # This file
 │
-├── data/                             # Data files (stored in S3; local copies optional)
-│   ├── LoanStats_2016Q1.csv          # Raw quarterly data files (download from Kaggle)
-│   ├── LoanStats_2016Q2.csv
-│   ├── LoanStats_2016Q3.csv
-│   └── LoanStats_2016Q4.csv
+├── .github/
+│   └── workflows/
+│       └── mlops_pipeline.yml        # CI/CD pipeline — 7 checkpoints
+│
+├── scripts/                          # CI/CD supporting scripts (one per checkpoint)
+│   ├── validate_data.py              # Checkpoint 1 — data validation
+│   ├── train_model.py                # Checkpoint 2 — SageMaker training job
+│   ├── evaluate_model.py             # Checkpoint 3 — evaluation gate
+│   ├── register_model.py             # Checkpoint 4 — model registry + model card
+│   ├── approve_model.py              # Checkpoint 5 helper — approve model package
+│   ├── deploy_model.py               # Checkpoint 6 — endpoint deployment (blue/green)
+│   ├── update_monitor.py             # Checkpoint 6 helper — monitor baseline update
+│   ├── smoke_test.py                 # Checkpoint 7 — live endpoint smoke test
+│   └── rollback_endpoint.py          # Rollback — reverts endpoint on smoke test failure
+│
+├── data/                             # ⚠️ NOT IN GITHUB — data lives in S3 (see below)
+│   └── .gitkeep
 │
 └── docs/
     ├── LoanStatus_ML_Design_Document_v2.docx   # ML System Design Document
     └── Discussion_7_1_Ethics_Group9.docx       # Ethics & privacy law analysis
 ```
 
-> **Data Note:** Raw CSV files are not committed to GitHub due to size. Download them from Kaggle ([sarahvch/predicting-who-pays-back-loans](https://www.kaggle.com/datasets/sarahvch/predicting-who-pays-back-loans)) and place them in the project root directory or set the `LOAN_DATA_DIR` environment variable to their location before running the notebook.
+### Data Storage Policy
+
+**Raw data files are NOT committed to GitHub.** All data lives in Amazon S3:
+
+| Data | S3 Path |
+|------|---------|
+| Raw CSV (filtered) | `s3://sagemaker-us-east-1-099405935674/aai540-group9-loan-project/data/loan_data_raw.csv` |
+| Parquet data lake | `s3://sagemaker-us-east-1-099405935674/aai540-group9-loan-project/data/` |
+| Train split | `s3://sagemaker-us-east-1-099405935674/aai540-group9-loan-project/train/train.csv` |
+| Validation split | `s3://sagemaker-us-east-1-099405935674/aai540-group9-loan-project/validation/validation.csv` |
+| Test split | `s3://sagemaker-us-east-1-099405935674/aai540-group9-loan-project/test/test.csv` |
+| Model artifact | `s3://sagemaker-us-east-1-099405935674/aai540-group9-loan-project/model/model.tar.gz` |
+
+To run the notebook locally, download the raw quarterly files from Kaggle and place them in the project root, or set:
+```bash
+export LOAN_DATA_DIR=/path/to/your/data/
+```
 
 ---
 
@@ -642,7 +670,7 @@ The cleanup section contains commented-out cells to delete AWS resources when th
 # predictor.delete_endpoint()
 ```
 
-> **Do not run cleanup until after the video demonstration is recorded.** The live endpoint and monitoring schedule are required for the video deliverable.
+>  **Do not run cleanup until after the video demonstration is recorded.** The live endpoint and monitoring schedule are required for the video deliverable.
 
 ---
 
@@ -712,11 +740,74 @@ The deployed endpoint runs on a single `ml.m5.large` instance. For production wo
 | 4 | **Data Quality Monitor** — detect input feature drift (e.g., avg `int_rate` shift) as leading indicator of model degradation | Earlier drift detection before accuracy drops |
 | 5 | **Full-dataset Feature Store ingestion** — scale from 50k to 421k records with incremental quarterly updates | Production-representative Feature Store |
 | 6 | **Feature enrichment with macroeconomic data** — add unemployment rate, Fed funds rate per Rajaraman's principle that more data beats better algorithms | Improved predictive power without algorithm changes |
-| 7 | **CI/CD automation via GitHub Actions** — automate the full pipeline from data validation through deployment with human approval gates | Reproducible, auditable retraining workflow |
+| 7 | **CI/CD automation via GitHub Actions** — `.github/workflows/mlops_pipeline.yml` + 8 scripts in `scripts/` | Done Implemented |
+
 
 ---
 
-## 12. MLOps Component Checklist
+## 12. CI/CD Pipeline
+
+The pipeline is defined in `.github/workflows/mlops_pipeline.yml` and implemented across 8 scripts in the `scripts/` directory. Triggered on push to `main` or `workflow_dispatch`.
+
+### The 7 Checkpoints
+
+```
+push to main
+     │
+     ▼
+[1] Data Validation      validate_data.py      Glue table + schema + row counts
+     │
+     ▼
+[2] Training Job         train_model.py        SageMaker XGBoost 1.7-1 (ml.m5.xlarge)
+     │
+     ▼
+[3] Evaluation Gate      evaluate_model.py     accuracy >= 0.75, weighted F1 >= 0.70
+     │ fail → EXIT 1 (pipeline stops, no registration)
+     ▼
+[4] Model Registration   register_model.py     Model Registry (PendingManualApproval) + Model Card
+     │
+     ▼
+[5] Human Approval       GitHub Environment    Required reviewer approves in GitHub UI
+     │                   approve_model.py      Sets status → Approved in Model Registry
+     ▼
+[6] Endpoint Deployment  deploy_model.py       Atomic config swap, zero downtime, Data Capture 100%
+                         update_monitor.py     Recomputes baseline + hourly schedule
+     │
+     ▼
+[7] Smoke Test           smoke_test.py         10 records: 3 probs, sum=1.0±0.01, p99 < 500ms
+     │ fail → rollback_endpoint.py restores previous version
+     ▼
+  Done Pipeline Complete
+```
+
+### Scripts Reference
+
+| Script | Checkpoint | Purpose |
+|--------|-----------|---------|
+| `validate_data.py` | 1 | Glue table existence, column schema, per-class row count via Athena |
+| `train_model.py` | 2 | Launch + wait for SageMaker training job, write artifact URI |
+| `evaluate_model.py` | 3 | Download model + test set, compute metrics, enforce quality gate |
+| `register_model.py` | 4 | Register versioned Model Package, update Model Card |
+| `approve_model.py` | 5 | Set Model Package status to `Approved` after human review |
+| `deploy_model.py` | 6 | Atomic endpoint config swap with Data Capture enabled |
+| `update_monitor.py` | 6 | Re-run baseline job, create new hourly monitoring schedule |
+| `smoke_test.py` | 7 | Invoke live endpoint, assert probabilities + latency |
+| `rollback_endpoint.py` | Rollback | Restore previous endpoint config on smoke test failure |
+
+### Required GitHub Secrets
+
+| Secret | Description |
+|--------|-------------|
+| `AWS_ACCESS_KEY_ID` | IAM access key with SageMaker, S3, Glue, CloudWatch permissions |
+| `AWS_SECRET_ACCESS_KEY` | Corresponding secret key |
+
+### Required GitHub Environment
+
+Create an environment named **`production`** under `Settings → Environments` and add team members as required reviewers. This is what enforces the human approval gate at Checkpoint 5.
+
+---
+
+## 14. MLOps Component Checklist
 
 This project was designed to demonstrate every major MLOps component covered in AAI-540. The table below maps each component to its implementation.
 
@@ -741,21 +832,20 @@ This project was designed to demonstrate every major MLOps component covered in 
 | Automated Alerting | CloudWatch Alarm on accuracy metric | Done |
 | Infrastructure Metrics | CloudWatch endpoint metrics (auto) | Done |
 | Data Ethics Analysis | Discussion 7.1 — FCRA, ECOA, CCPA, ADPPA | Done |
-| CI/CD Pipeline | Designed in Design Document; not automated | Planned |
-| Bias Detection | SageMaker Clarify integration | Planned |
-| Data Quality Monitor | Feature drift detection | Planned |
+| CI/CD Pipeline | Designed in Design Document; not automated | 📋 Planned |
+| Bias Detection | SageMaker Clarify integration | 📋 Planned |
+| Data Quality Monitor | Feature drift detection | 📋 Planned |
 
 ---
 
 ## 13. Team
 
 **Group 9 — AAI-540 Machine Learning Operations**  
-University of San Diego — Applied Artificial Intelligence
+University of San Diego — Applied Artificial Intelligence Program
 
 | Member | Email |
 |--------|-------|
-| Vinay Mittal | [vmittal@sandiego.edu |
-
+| Vinay Mittal | vmittal@sandiego.edu |
 ---
 
 ## 14. References
