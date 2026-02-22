@@ -184,12 +184,9 @@ aai540-group9-loan-project/
 │   ├── smoke_test.py                 # Checkpoint 7 — live endpoint smoke test
 │   └── rollback_endpoint.py          # Rollback — reverts endpoint on smoke test failure
 │
-├── data/                             # ⚠️ NOT IN GITHUB — data lives in S3 (see below)
+├── data/                             # NOT IN GITHUB DUE TO SIZE ISSUE — data lives in S3 (see below) or can be pulled from kaggle
 │   └── .gitkeep
-│
-└── docs/
-    ├── LoanStatus_ML_Design_Document_v2.docx   # ML System Design Document
-    └── Discussion_7_1_Ethics_Group9.docx       # Ethics & privacy law analysis
+
 ```
 
 ### Data Storage Policy
@@ -832,9 +829,9 @@ This project was designed to demonstrate every major MLOps component covered in 
 | Automated Alerting | CloudWatch Alarm on accuracy metric | Done |
 | Infrastructure Metrics | CloudWatch endpoint metrics (auto) | Done |
 | Data Ethics Analysis | Discussion 7.1 — FCRA, ECOA, CCPA, ADPPA | Done |
-| CI/CD Pipeline | Designed in Design Document; not automated | 📋 Planned |
-| Bias Detection | SageMaker Clarify integration | 📋 Planned |
-| Data Quality Monitor | Feature drift detection | 📋 Planned |
+| CI/CD Pipeline | Designed in Design Document; not automated | Planned |
+| Bias Detection | SageMaker Clarify integration | Planned |
+| Data Quality Monitor | Feature drift detection | Planned |
 
 ---
 
